@@ -1,0 +1,16 @@
+.DS_Store
+Thumbs.db
+
+.vscode/.ropeproject
+sourcemap.json
+
+*.rbxl.lock
+*.rbxlx.lock
+*.rbxm.lock
+*.rbxmx.lock
+
+tools/
+
+out/
+build/
+dist/

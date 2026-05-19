@@ -1,0 +1,25 @@
+{
+  "$schema": "https://raw.githubusercontent.com/rojo-rbx/rojo/master/schemas/project.template.schema.json",
+  "name": "BlockTurns",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Shared": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "main": {
+        "$path": "src/server/main"
+      }
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "ServerBootstrap": {
+        "$path": "src/server/ServerBootstrap.server.luau"
+      }
+    }
+  }
+}
