@@ -47,11 +47,17 @@ local MATCH_READY_TIMEOUT_SECONDS = 30
 local initialized = false
 local nextMatchId = 0
 local queue: { Player } = {}
+local queueHead = 1
+local queueTail = 0
+local queuedCount = 0
+local staleQueueSlots = 0
 local queuedUserIds: { [number]: boolean } = {}
-local waitingForDataUserIds: { [number]: boolean } = {}
+local waitingForDataTokens: { [number]: number } = {}
+local nextReadyWaitToken = 0
 local activeMatches: { [number]: Match } = {}
 local playerMatchIds: { [number]: number } = {}
 local connections: { Connection } = {}
+local creatingMatches = false
 
 RoundSystem.TeamSize = TEAM_SIZE
 RoundSystem.RequiredPlayers = REQUIRED_PLAYERS
@@ -68,30 +74,87 @@ local function isPlayerAvailable(player: Player): boolean
 	return isPlayerInGame(player) and playerMatchIds[player.UserId] == nil
 end
 
+local function trimQueueBuffer()
+	if queueTail == 0 then
+		return
+	end
+
+	local staleLimit = math.max(32, queuedCount)
+
+	if queueHead < 64 and queueHead < queueTail / 2 and staleQueueSlots < staleLimit then
+		return
+	end
+
+	local writeIndex = 1
+
+	for readIndex = queueHead, queueTail do
+		local player = queue[readIndex]
+
+		if player ~= nil and queuedUserIds[player.UserId] then
+			queue[writeIndex] = player
+			writeIndex += 1
+		end
+	end
+
+	for index = writeIndex, queueTail do
+		queue[index] = nil
+	end
+
+	queueHead = 1
+	queueTail = writeIndex - 1
+	staleQueueSlots = 0
+end
+
+local function advanceQueueHead()
+	while queueHead <= queueTail do
+		local player = queue[queueHead]
+
+		if player ~= nil and queuedUserIds[player.UserId] then
+			break
+		end
+
+		queue[queueHead] = nil
+		queueHead += 1
+	end
+
+	trimQueueBuffer()
+end
+
+local function resetQueue()
+	table.clear(queue)
+	table.clear(queuedUserIds)
+
+	queueHead = 1
+	queueTail = 0
+	queuedCount = 0
+	staleQueueSlots = 0
+end
+
 local function removeQueuedPlayer(userId: number)
 	if not queuedUserIds[userId] then
 		return
 	end
 
 	queuedUserIds[userId] = nil
+	queuedCount = math.max(queuedCount - 1, 0)
+	staleQueueSlots += 1
 
-	for index = #queue, 1, -1 do
-		if queue[index].UserId == userId then
-			table.remove(queue, index)
-			return
-		end
-	end
+	advanceQueueHead()
 end
 
 local function compactQueue()
-	for index = #queue, 1, -1 do
+	for index = queueHead, queueTail do
 		local player = queue[index]
 
-		if not isPlayerAvailable(player) then
+		if player ~= nil and queuedUserIds[player.UserId] and not isPlayerAvailable(player) then
 			queuedUserIds[player.UserId] = nil
-			table.remove(queue, index)
+			queuedCount = math.max(queuedCount - 1, 0)
+			staleQueueSlots += 1
+			queue[index] = nil
 		end
 	end
+
+	advanceQueueHead()
 end
 
 local function queuePlayer(player: Player)
@@ -100,20 +163,30 @@ local function queuePlayer(player: Player)
 	end
 
 	queuedUserIds[player.UserId] = true
-	table.insert(queue, player)
+	queuedCount += 1
+	queueTail += 1
+	queue[queueTail] = player
 end
 
 local function queuePlayerWhenReady(player: Player)
-	if not initialized or not isPlayerInGame(player) or waitingForDataUserIds[player.UserId] then
+	if not initialized or not isPlayerInGame(player) or waitingForDataTokens[player.UserId] ~= nil then
 		return
 	end
 
-	waitingForDataUserIds[player.UserId] = true
+	nextReadyWaitToken += 1
+
+	local userId = player.UserId
+	local waitToken = nextReadyWaitToken
+	waitingForDataTokens[userId] = waitToken
 
 	task.spawn(function()
-		local userId = player.UserId
 		local data = DataManager.WaitForData(player, MATCH_READY_TIMEOUT_SECONDS)
-		waitingForDataUserIds[userId] = nil
+
+		if waitingForDataTokens[userId] ~= waitToken then
+			return
+		end
+
+		waitingForDataTokens[userId] = nil
 
 		if not initialized or data == nil or not isPlayerAvailable(player) then
 			return
@@ -127,20 +200,30 @@ end
 local function popMatchPlayers(): { Player }?
 	compactQueue()
 
-	if #queue < REQUIRED_PLAYERS then
+	if queuedCount < REQUIRED_PLAYERS then
 		return nil
 	end
 
 	local players = {}
 
-	while #players < REQUIRED_PLAYERS and #queue > 0 do
-		local player = table.remove(queue, 1)
+	while #players < REQUIRED_PLAYERS and queueHead <= queueTail do
+		local player = queue[queueHead]
+		queue[queueHead] = nil
+		queueHead += 1
+
+		if player == nil or not queuedUserIds[player.UserId] then
+			continue
+		end
+
 		queuedUserIds[player.UserId] = nil
+		queuedCount = math.max(queuedCount - 1, 0)
 
 		if isPlayerAvailable(player) then
 			table.insert(players, player)
 		end
 	end
+
+	advanceQueueHead()
 
 	if #players < REQUIRED_PLAYERS then
 		for _, player in players do
@@ -210,7 +293,7 @@ local function cancelMatch(matchId: number, requeuePlayers: boolean, excludedUse
 end
 
 local function onPlayerRemoving(player: Player)
-	waitingForDataUserIds[player.UserId] = nil
+	waitingForDataTokens[player.UserId] = nil
 	removeQueuedPlayer(player.UserId)
 
 	local matchId = playerMatchIds[player.UserId]
@@ -251,7 +334,18 @@ end
 
 function RoundSystem.GetQueuedPlayers(): { Player }
 	compactQueue()
-	return table.clone(queue)
+
+	local players = {}
+
+	for index = queueHead, queueTail do
+		local player = queue[index]
+
+		if player ~= nil and queuedUserIds[player.UserId] then
+			table.insert(players, player)
+		end
+	end
+
+	return players
 end
 
 function RoundSystem.TryCreateMatch(): Match?
@@ -265,19 +359,35 @@ function RoundSystem.TryCreateMatch(): Match?
 end
 
 function RoundSystem.TryCreateMatches(): { Match }
-	local createdMatches = {}
-
-	while true do
-		local match = RoundSystem.TryCreateMatch()
-
-		if match == nil then
-			break
-		end
-
-		table.insert(createdMatches, match)
+	if creatingMatches then
+		return {}
 	end
 
-	return createdMatches
+	creatingMatches = true
+
+	local ok, result = xpcall(function()
+		local createdMatches = {}
+
+		while true do
+			local match = RoundSystem.TryCreateMatch()
+
+			if match == nil then
+				break
+			end
+
+			table.insert(createdMatches, match)
+		end
+
+		return createdMatches
+	end, debug.traceback)
+
+	creatingMatches = false
+
+	if not ok then
+		error(`Failed to create matches: {result}`, 0)
+	end
+
+	return result
 end
 
 function RoundSystem.EndMatch(matchId: number)
@@ -292,6 +402,7 @@ function RoundSystem.EndMatch(matchId: number)
 	activeMatches[matchId] = nil
 
 	releaseMatchPlayers(match, false, nil)
+	RoundSystem.TryCreateMatches()
 end
 
 function RoundSystem.Initialize()
@@ -324,9 +435,8 @@ function RoundSystem.Destroy()
 	end
 
 	table.clear(connections)
-	table.clear(queue)
-	table.clear(queuedUserIds)
-	table.clear(waitingForDataUserIds)
+	resetQueue()
+	table.clear(waitingForDataTokens)
 
 	local matchIds = {}
 	for matchId in activeMatches do
