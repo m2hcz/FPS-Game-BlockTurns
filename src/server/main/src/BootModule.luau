@@ -40,11 +40,6 @@ local systems: { SystemDefinition<LifecycleModule> } = {
 		required = true,
 	},
 	{
-		name = "RoundSystem",
-		module = RoundSystem,
-		required = true,
-	},
-	{
 		name = "PlayerSystem",
 		module = PlayerSystemModule.PlayerSystem,
 		required = true,
@@ -52,6 +47,11 @@ local systems: { SystemDefinition<LifecycleModule> } = {
 	{
 		name = "WeaponSystem",
 		module = WeaponSystem,
+		required = true,
+	},
+	{
+		name = "RoundSystem",
+		module = RoundSystem,
 		required = true,
 	},
 }
