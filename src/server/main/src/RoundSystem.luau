@@ -1,5 +1,6 @@
 local RoundSystem = {}
 
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
 
 local src = script.Parent
@@ -12,6 +13,7 @@ local serverNet = require(src:WaitForChild("serverNet"))
 export type MatchStatus = "Active" | "Cancelled" | "Ended"
 export type MatchPhase = "CharacterSelection" | "WeaponSelection" | "Action" | "RoundEnded"
 export type MatchTeamName = "Blue" | "Red"
+type MatchHistoryResult = "Win" | "Loss" | "Draw"
 
 export type MatchPlayer = {
 	Player: Player,
@@ -26,6 +28,7 @@ export type MatchScores = {
 
 export type Match = {
 	Id: number,
+	Key: string,
 	Status: MatchStatus,
 	Phase: MatchPhase,
 	PhaseToken: number,
@@ -76,6 +79,7 @@ local ACTION_SECONDS = 180
 local ROUND_END_SECONDS = 5
 local MAX_ROUNDS = 5
 local ROUNDS_TO_WIN = 3
+local SERVER_MATCH_SCOPE = if game.JobId ~= "" then game.JobId else HttpService:GenerateGUID(false)
 
 local PHASE_DURATIONS: { [MatchPhase]: number } = {
 	CharacterSelection = CHARACTER_SELECTION_SECONDS,
@@ -294,9 +298,51 @@ local function getMatchPlayerInstances(match: Match): { Player }
 	return players
 end
 
+local function getWinningTeam(match: Match): MatchTeamName?
+	if match.Scores.Blue > match.Scores.Red then
+		return "Blue"
+	end
+
+	if match.Scores.Red > match.Scores.Blue then
+		return "Red"
+	end
+
+	return nil
+end
+
+local function getResultForTeam(match: Match, teamName: MatchTeamName): MatchHistoryResult
+	local winningTeam = getWinningTeam(match)
+
+	if winningTeam == nil then
+		return "Draw"
+	end
+
+	if winningTeam == teamName then
+		return "Win"
+	end
+
+	return "Loss"
+end
+
 local function buildMatchSnapshot(match: Match, player: Player)
+	local teamAttribute = player:GetAttribute("MatchTeam")
+	local team: MatchTeamName? = nil
+	local winningTeam = if match.Status == "Ended" then getWinningTeam(match) else nil
+	local matchResult: MatchHistoryResult? = nil
+
+	if teamAttribute == "Blue" then
+		team = "Blue"
+	elseif teamAttribute == "Red" then
+		team = "Red"
+	end
+
+	if match.Status == "Ended" and team ~= nil then
+		matchResult = getResultForTeam(match, team)
+	end
+
 	return {
 		matchId = match.Id,
+		matchKey = match.Key,
 		status = match.Status,
 		phase = match.Phase,
 		phaseStartedAtUnix = match.PhaseStartedAtUnix,
@@ -305,9 +351,11 @@ local function buildMatchSnapshot(match: Match, player: Player)
 		maxRounds = match.MaxRounds,
 		roundsToWin = match.RoundsToWin,
 		lastRoundWinner = match.LastRoundWinner,
+		winningTeam = winningTeam,
+		matchResult = matchResult,
 		scoreBlue = match.Scores.Blue,
 		scoreRed = match.Scores.Red,
-		team = player:GetAttribute("MatchTeam"),
+		team = team,
 		selectedCharacter = player:GetAttribute("SelectedCharacter"),
 		selectedWeapon = player:GetAttribute("SelectedWeapon"),
 		characterOptions = PlayerSystem.GetCharacterOptions(),
@@ -372,6 +420,46 @@ local function setMatchPhase(match: Match, phase: MatchPhase)
 	end)
 end
 
+local function recordMatchResults(match: Match)
+	if match.Status ~= "Ended" then
+		return
+	end
+
+	for _, matchPlayer in match.Players do
+		local player = matchPlayer.Player
+
+		if not isPlayerInGame(player) then
+			continue
+		end
+
+		local selectedCharacter = player:GetAttribute("SelectedCharacter")
+		local selectedWeapon = player:GetAttribute("SelectedWeapon")
+
+		local recorded = false
+		local ok, err = pcall(function()
+			recorded = DataManager.RecordMatchResult(player, {
+				MatchKey = match.Key,
+				MatchId = match.Id,
+				Result = getResultForTeam(match, matchPlayer.Team),
+				Team = matchPlayer.Team,
+				ScoreBlue = match.Scores.Blue,
+				ScoreRed = match.Scores.Red,
+				RoundCount = match.RoundNumber,
+				StartedAtUnix = match.CreatedAtUnix,
+				EndedAtUnix = match.EndedAtUnix or nowUnix(),
+				SelectedCharacter = if type(selectedCharacter) == "string" then selectedCharacter else nil,
+				SelectedWeapon = if type(selectedWeapon) == "string" then selectedWeapon else nil,
+			})
+		end)
+
+		if not ok then
+			warn(`Failed to record match result for {player.Name}: {err}`)
+		elseif not recorded then
+			warn(`Skipped match result for {player.Name}: player data was not loaded`)
+		end
+	end
+end
+
 local function releaseMatchPlayers(match: Match, requeuePlayers: boolean, excludedUserId: number?)
 	for _, matchPlayer in match.Players do
 		local player = matchPlayer.Player
@@ -399,6 +487,7 @@ local function finishMatch(matchId: number, status: MatchStatus, requeuePlayers:
 	match.PhaseToken += 1
 	activeMatches[matchId] = nil
 
+	recordMatchResults(match)
 	setMatchAttributes(match)
 	notifyMatch(match)
 	releaseMatchPlayers(match, requeuePlayers, excludedUserId)
@@ -539,6 +628,7 @@ local function createMatch(players: { Player }): Match
 	local timestamp = nowUnix()
 	local match: Match = {
 		Id = nextMatchId,
+		Key = `{SERVER_MATCH_SCOPE}:{nextMatchId}`,
 		Status = "Active",
 		Phase = "CharacterSelection",
 		PhaseToken = 0,

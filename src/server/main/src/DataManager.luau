@@ -17,9 +17,44 @@ local FastSignal = require(lib:WaitForChild("FastSignal"))
 local serverNet = require(src:WaitForChild("serverNet"))
 local ProfileStore = require(serverlib:WaitForChild("ProfileStore"))
 
+local MATCH_HISTORY_LIMIT = 50
+
+export type MatchHistoryResult = "Win" | "Loss" | "Draw"
+
+export type MatchHistoryEntry = {
+	MatchKey: string,
+	MatchId: number,
+	Result: MatchHistoryResult,
+	Team: string,
+	ScoreBlue: number,
+	ScoreRed: number,
+	RoundCount: number,
+	StartedAtUnix: number,
+	EndedAtUnix: number,
+	SelectedCharacter: string?,
+	SelectedWeapon: string?,
+}
+
+export type MatchResultInput = {
+	MatchKey: string,
+	MatchId: number,
+	Result: MatchHistoryResult,
+	Team: string,
+	ScoreBlue: number,
+	ScoreRed: number,
+	RoundCount: number,
+	StartedAtUnix: number,
+	EndedAtUnix: number,
+	SelectedCharacter: string?,
+	SelectedWeapon: string?,
+}
+
 export type PlayerData = {
 	DataVersion: number,
+	Wins: number,
+	Losses: number,
 	Winstreak: number,
+	MatchHistory: { MatchHistoryEntry },
 
 	CreatedAtUnix: number,
 	LastLoginUnix: number,
@@ -68,10 +103,13 @@ type DataManagerType = {
 	Signals: { [number]: Signal<PlayerData> },
 	LoadedPlayers: { [number]: boolean },
 	ServerMaid: MaidObject,
+	MatchHistoryLimit: number,
 
 	Initialize: () -> (),
 	Destroy: () -> (),
 	GetData: (player: Player) -> PlayerData?,
+	GetMatchHistory: (player: Player, limit: number?) -> { MatchHistoryEntry },
+	RecordMatchResult: (player: Player, result: MatchResultInput) -> boolean,
 	WaitForData: (player: Player, timeoutSeconds: number?) -> PlayerData?,
 	IsLoaded: (player: Player) -> boolean,
 }
@@ -79,8 +117,11 @@ type DataManagerType = {
 local PlayerDataClass = {}
 
 PlayerDataClass.Default = table.freeze({
-	DataVersion = 1,
+	DataVersion = 2,
+	Wins = 0,
+	Losses = 0,
 	Winstreak = 0,
+	MatchHistory = table.freeze({}),
 
 	CreatedAtUnix = 0,
 	LastLoginUnix = 0,
@@ -88,7 +129,17 @@ PlayerDataClass.Default = table.freeze({
 }) :: PlayerData
 
 function PlayerDataClass.new(): PlayerData
-	return table.clone(PlayerDataClass.Default)
+	return {
+		DataVersion = PlayerDataClass.Default.DataVersion,
+		Wins = PlayerDataClass.Default.Wins,
+		Losses = PlayerDataClass.Default.Losses,
+		Winstreak = PlayerDataClass.Default.Winstreak,
+		MatchHistory = {},
+
+		CreatedAtUnix = PlayerDataClass.Default.CreatedAtUnix,
+		LastLoginUnix = PlayerDataClass.Default.LastLoginUnix,
+		LastLogoutUnix = PlayerDataClass.Default.LastLogoutUnix,
+	}
 end
 
 local function normalizeNumber(value: unknown, fallback: number): number
@@ -109,16 +160,117 @@ local function normalizeNumber(value: unknown, fallback: number): number
 	return numberValue
 end
 
+local function normalizeNonNegativeInteger(value: unknown, fallback: number): number
+	local numberValue = math.floor(normalizeNumber(value, fallback))
+
+	if numberValue < 0 then
+		return 0
+	end
+
+	return numberValue
+end
+
+local function normalizeUnixTimestamp(value: unknown, fallback: number, now: number): number
+	local timestamp = normalizeNonNegativeInteger(value, fallback)
+
+	if timestamp > now then
+		return now
+	end
+
+	return timestamp
+end
+
+local function normalizeString(value: unknown): string?
+	if type(value) ~= "string" then
+		return nil
+	end
+
+	if value == "" then
+		return nil
+	end
+
+	return value
+end
+
+local function normalizeResult(value: unknown): MatchHistoryResult
+	if value == "Win" or value == "Loss" or value == "Draw" then
+		return value
+	end
+
+	return "Draw"
+end
+
+local function normalizeHistoryEntry(rawEntry: any, now: number): MatchHistoryEntry?
+	if type(rawEntry) ~= "table" then
+		return nil
+	end
+
+	local matchId = normalizeNonNegativeInteger(rawEntry.MatchId, 0)
+
+	if matchId <= 0 then
+		return nil
+	end
+
+	local matchKey = normalizeString(rawEntry.MatchKey) or tostring(matchId)
+	local endedAtUnix = normalizeUnixTimestamp(rawEntry.EndedAtUnix, now, now)
+	local startedAtUnix = normalizeUnixTimestamp(rawEntry.StartedAtUnix, endedAtUnix, now)
+
+	if startedAtUnix > endedAtUnix then
+		startedAtUnix = endedAtUnix
+	end
+
+	return {
+		MatchKey = matchKey,
+		MatchId = matchId,
+		Result = normalizeResult(rawEntry.Result),
+		Team = normalizeString(rawEntry.Team) or "",
+		ScoreBlue = normalizeNonNegativeInteger(rawEntry.ScoreBlue, 0),
+		ScoreRed = normalizeNonNegativeInteger(rawEntry.ScoreRed, 0),
+		RoundCount = normalizeNonNegativeInteger(rawEntry.RoundCount, 0),
+		StartedAtUnix = startedAtUnix,
+		EndedAtUnix = endedAtUnix,
+		SelectedCharacter = normalizeString(rawEntry.SelectedCharacter),
+		SelectedWeapon = normalizeString(rawEntry.SelectedWeapon),
+	}
+end
+
+local function normalizeMatchHistory(rawHistory: unknown, now: number): { MatchHistoryEntry }
+	if type(rawHistory) ~= "table" then
+		return {}
+	end
+
+	local normalized: { MatchHistoryEntry } = {}
+	local rawHistoryArray = rawHistory :: { any }
+	local endIndex = math.min(#rawHistoryArray, MATCH_HISTORY_LIMIT)
+
+	for index = 1, endIndex do
+		local entry = normalizeHistoryEntry(rawHistoryArray[index], now)
+
+		if entry then
+			table.insert(normalized, entry)
+		end
+	end
+
+	while #normalized > MATCH_HISTORY_LIMIT do
+		normalized[#normalized] = nil
+	end
+
+	return normalized
+end
+
 function PlayerDataClass.reconcile(rawData: any): PlayerData
 	local now = DateTime.now().UnixTimestamp
 	local data = rawData :: PlayerData
 
-	data.DataVersion = normalizeNumber(data.DataVersion, PlayerDataClass.Default.DataVersion)
-	data.Winstreak = normalizeNumber(data.Winstreak, PlayerDataClass.Default.Winstreak)
+	data.DataVersion = PlayerDataClass.Default.DataVersion
+	data.Wins = normalizeNonNegativeInteger(data.Wins, PlayerDataClass.Default.Wins)
+	data.Losses = normalizeNonNegativeInteger(data.Losses, PlayerDataClass.Default.Losses)
+	data.Winstreak = normalizeNonNegativeInteger(data.Winstreak, PlayerDataClass.Default.Winstreak)
+	data.MatchHistory = normalizeMatchHistory(data.MatchHistory, now)
 
-	data.CreatedAtUnix = normalizeNumber(data.CreatedAtUnix, 0)
-	data.LastLoginUnix = normalizeNumber(data.LastLoginUnix, 0)
-	data.LastLogoutUnix = normalizeNumber(data.LastLogoutUnix, 0)
+	data.CreatedAtUnix = normalizeUnixTimestamp(data.CreatedAtUnix, 0, now)
+	data.LastLoginUnix = normalizeUnixTimestamp(data.LastLoginUnix, 0, now)
+	data.LastLogoutUnix = normalizeUnixTimestamp(data.LastLogoutUnix, 0, now)
 
 	if data.CreatedAtUnix <= 0 then
 		data.CreatedAtUnix = now
@@ -127,6 +279,50 @@ function PlayerDataClass.reconcile(rawData: any): PlayerData
 	data.LastLoginUnix = now
 
 	return data
+end
+
+function PlayerDataClass.recordMatchResult(data: PlayerData, input: MatchResultInput): MatchHistoryEntry
+	local now = DateTime.now().UnixTimestamp
+	local endedAtUnix = normalizeUnixTimestamp(input.EndedAtUnix, now, now)
+	local startedAtUnix = normalizeUnixTimestamp(input.StartedAtUnix, endedAtUnix, now)
+
+	if startedAtUnix > endedAtUnix then
+		startedAtUnix = endedAtUnix
+	end
+
+	local result = normalizeResult(input.Result)
+	local matchId = normalizeNonNegativeInteger(input.MatchId, 0)
+	local entry: MatchHistoryEntry = {
+		MatchKey = normalizeString(input.MatchKey) or tostring(matchId),
+		MatchId = matchId,
+		Result = result,
+		Team = normalizeString(input.Team) or "",
+		ScoreBlue = normalizeNonNegativeInteger(input.ScoreBlue, 0),
+		ScoreRed = normalizeNonNegativeInteger(input.ScoreRed, 0),
+		RoundCount = normalizeNonNegativeInteger(input.RoundCount, 0),
+		StartedAtUnix = startedAtUnix,
+		EndedAtUnix = endedAtUnix,
+		SelectedCharacter = normalizeString(input.SelectedCharacter),
+		SelectedWeapon = normalizeString(input.SelectedWeapon),
+	}
+
+	if result == "Win" then
+		data.Wins += 1
+		data.Winstreak += 1
+	elseif result == "Loss" then
+		data.Losses += 1
+		data.Winstreak = 0
+	else
+		data.Winstreak = 0
+	end
+
+	table.insert(data.MatchHistory, 1, entry)
+
+	while #data.MatchHistory > MATCH_HISTORY_LIMIT do
+		data.MatchHistory[#data.MatchHistory] = nil
+	end
+
+	return entry
 end
 
 function PlayerDataClass.markLogout(data: PlayerData)
@@ -153,6 +349,7 @@ DataManager.Maids = Maids
 DataManager.Signals = Signals
 DataManager.LoadedPlayers = {}
 DataManager.ServerMaid = Maid.new()
+DataManager.MatchHistoryLimit = MATCH_HISTORY_LIMIT
 
 local initialized = false
 local shuttingDown = false
@@ -239,6 +436,8 @@ local function loadLeaderstats(player: Player, data: PlayerData)
 	end
 
 	upsertNumberValue(leaderstats, "Winstreak", data.Winstreak)
+	upsertNumberValue(leaderstats, "Wins", data.Wins)
+	upsertNumberValue(leaderstats, "Losses", data.Losses)
 end
 
 local function fireBootClient(player: Player)
@@ -415,6 +614,36 @@ end
 
 function DataManager.IsLoaded(player: Player): boolean
 	return Profiles[player.UserId] ~= nil
+end
+
+function DataManager.GetMatchHistory(player: Player, limit: number?): { MatchHistoryEntry }
+	local data = DataManager.GetData(player)
+
+	if data == nil then
+		return {}
+	end
+
+	local maxEntries = math.clamp(normalizeNonNegativeInteger(limit, MATCH_HISTORY_LIMIT), 0, MATCH_HISTORY_LIMIT)
+	local history = {}
+
+	for index = 1, math.min(maxEntries, #data.MatchHistory) do
+		table.insert(history, table.clone(data.MatchHistory[index]))
+	end
+
+	return history
+end
+
+function DataManager.RecordMatchResult(player: Player, result: MatchResultInput): boolean
+	local data = DataManager.GetData(player)
+
+	if data == nil then
+		return false
+	end
+
+	PlayerDataClass.recordMatchResult(data, result)
+	loadLeaderstats(player, data)
+
+	return true
 end
 
 function DataManager.WaitForData(player: Player, timeoutSeconds: number?): PlayerData?
