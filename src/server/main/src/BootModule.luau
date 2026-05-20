@@ -35,13 +35,13 @@ local systems: { SystemDefinition<LifecycleModule> } = {
 		required = true,
 	},
 	{
-		name = "RoundSystem",
-		module = RoundSystem,
+		name = "TeamSystem",
+		module = TeamSystem,
 		required = true,
 	},
 	{
-		name = "TeamSystem",
-		module = TeamSystem,
+		name = "RoundSystem",
+		module = RoundSystem,
 		required = true,
 	},
 	{
